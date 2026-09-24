@@ -1,0 +1,15 @@
+.gradle/
+build/
+app/build/
+jdk17/
+android-sdk/
+tmp/
+Nova pasta/
+output/
+docs/screenshots/
+local.properties
+*.iml
+.idea/
+*.apk
+*.aab
+*.log

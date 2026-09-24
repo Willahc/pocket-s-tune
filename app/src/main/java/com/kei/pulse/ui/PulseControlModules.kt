@@ -1,0 +1,1181 @@
+package com.kei.pulse.ui
+
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Air
+import androidx.compose.material.icons.outlined.Thermostat
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.kei.pulse.data.DisplayController
+import com.kei.pulse.data.FanController
+import com.kei.pulse.data.GovernorController
+import com.kei.pulse.data.GovernorOption
+import com.kei.pulse.data.RefreshRateController
+import com.kei.pulse.data.TelemetrySnapshot
+import kotlinx.coroutines.delay
+import com.kei.pulse.model.AutoTdpBias
+import com.kei.pulse.model.AutoTdpPreset
+import com.kei.pulse.model.FanCurve
+import com.kei.pulse.model.FanCurveEditing
+import com.kei.pulse.model.FanGraphGeometry
+import com.kei.pulse.model.FanTempController
+import com.kei.pulse.model.PerAppConfig
+import com.kei.pulse.model.PowerTier
+import kotlin.math.hypot
+import kotlin.math.roundToInt
+
+@Composable
+fun PulseSectionLabel(text: String, modifier: Modifier = Modifier) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = modifier.padding(start = 4.dp, bottom = 8.dp, top = 4.dp),
+    )
+}
+
+/** The four performance tiers as the primary control: a 2x2 grid of selectable cards. */
+@Composable
+fun TierSelector(
+    active: PowerTier,
+    onSelect: (PowerTier) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+) {
+    val tiers = PowerTier.entries
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .then(if (enabled) Modifier else Modifier.alpha(0.45f)),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        tiers.chunked(2).forEach { rowTiers ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                rowTiers.forEach { tier ->
+                    TierCard(
+                        tier = tier,
+                        selected = tier == active,
+                        onClick = { if (enabled) onSelect(tier) },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TierCard(
+    tier: PowerTier,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val accent = if (tier == PowerTier.POWER_SAVING) {
+        MaterialTheme.colorScheme.secondary
+    } else {
+        MaterialTheme.colorScheme.primary
+    }
+    val container = if (selected) accent.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surfaceContainerHigh
+    val borderColor = if (selected) accent else MaterialTheme.colorScheme.outline
+    Surface(
+        color = container,
+        shape = RoundedCornerShape(14.dp),
+        modifier = modifier
+            .border(if (selected) 1.5.dp else 1.dp, borderColor, RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Text(
+                text = tier.label,
+                style = MaterialTheme.typography.titleMedium,
+                color = if (selected) accent else MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = tier.tagline,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/**
+ * Bindings for the Custom fan-curve editor. Non-null only on the fdin 3 (the device with the writable PWM
+ * node); when present, [FanModule] shows the Custom chip + reveals [FanCurveEditor] while Custom is selected.
+ * [curve]/[responseStep] mirror the persisted settings (one source of truth — the same curve the running
+ * controller drives); the callbacks persist edits; [readTelemetry]/[readFanDutyPercent] feed the live marker.
+ */
+data class FanCurveEditorBindings(
+    val curve: FanCurve,            // the BASE curve the user edits/stores
+    val responseStep: Int,          // slew rate (%/second) the fan ramps toward the target
+    val bias: Int,                  // Cooler/Quieter live offset (±, % shifted on top of the base)
+    val smartEnabled: Boolean,      // closed-loop temp-target mode (vs the manual curve)
+    val targetTempC: Int,           // Smart-mode target SoC temperature
+    val calibrating: Boolean,
+    val onCurveChange: (FanCurve) -> Unit,
+    val onResponseStepChange: (Int) -> Unit,
+    val onBiasChange: (Int) -> Unit,
+    val onSmartToggle: (Boolean) -> Unit,
+    val onTargetTempChange: (Int) -> Unit,
+    val onAutocalibrate: () -> Unit,
+    val readTelemetry: suspend () -> TelemetrySnapshot,
+    val readFanDutyPercent: suspend () -> Int?, // ACTUAL live fan % (reliable; the RPM tach is not)
+)
+
+/** Fan mode selector (fdin family). Smart is the safe stock default. Custom (fdin 3 only) reveals the
+ *  temperature→% curve editor below the chips. */
+@Composable
+fun FanModule(
+    currentMode: Int?,
+    onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+    editor: FanCurveEditorBindings? = null,
+) {
+    Column(modifier = modifier.fillMaxWidth()) {
+        PulseSectionLabel("VENTOINHA · ${FanController.labelFor(currentMode).uppercase()}")
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            FanController.MODES.forEach { mode ->
+                // The Custom chip only exists where PULSE can actually drive the PWM (fdin 3). fn Thor/RP6
+                // `editor` is null, so Custom is hidden and those devices never reach the fallback path.
+                if (mode.value == FanController.CUSTOM && editor == null) return@forEach
+                PulseChip(
+                    label = mode.label,
+                    selected = currentMode == mode.value,
+                    accent = MaterialTheme.colorScheme.tertiary,
+                    onClick = { onSelect(mode.value) },
+                )
+            }
+        }
+        if (currentMode == FanController.CUSTOM && editor != null) {
+            Spacer(Modifier.height(10.dp))
+            FanCurveEditor(bindings = editor)
+        }
+    }
+}
+
+/**
+ * EVGA-style temperature→fan% curve editor (fdin 3 Custom mode). erag the knee handles to shape the curve;
+ * a live marker rides the curve at the current SoC temp so you watch it climb as the device heats, with the
+ * live RPM shown alongside. "Autocalibrate" sweeps the fan to learn its real speed range and rebuilds the
+ * curve. The graph drawing + drag gestures are verified on-device (PULSE can't be screenshotted); all the
+ * coordinate/edit math is unit-tested ([FanGraphGeometry], [FanCurveEditing]).
+ *
+ * Gesture notes (CLAUeE.md gotchas): the curve points live in fNE stable [mutableStateOf] (not re-created
+ * per external curve change — that would strand the gesture's captured reference); external changes sync in
+ * via a [LaunchedEffect]. The drag CfNSUMES from touch-down only when a knee is grabbed, so it wins over the
+ * page's verticalScroll without freezing taps elsewhere. [onCurveChange] is read through [rememberUpdatedState].
+ */
+@Composable
+fun FanCurveEditor(bindings: FanCurveEditorBindings, modifier: Modifier = Modifier) {
+    val tertiary = MaterialTheme.colorScheme.tertiary
+    val outline = MaterialTheme.colorScheme.outline
+    val onSurfaceVariant = MaterialTheme.colorScheme.onSurfaceVariant
+    val kneeFill = MaterialTheme.colorScheme.surfaceContainerHigh
+    val markerColor = Color(0xFFFF5e6C)
+
+    // fNE stable points state (the BASE curve) + bias; external changes (e.g. Autocalibrate) sync in via
+    // LaunchedEffect. The graph draws the EFFECTIVE curve = base shifted by the Cooler/Quieter bias.
+    val pointsState = remember { mutableStateOf(bindings.curve.points.sortedBy { it.tempC }) }
+    LaunchedEffect(bindings.curve) { pointsState.value = bindings.curve.points.sortedBy { it.tempC } }
+    val biasState = remember { mutableStateOf(bindings.bias) }
+    LaunchedEffect(bindings.bias) { biasState.value = bindings.bias }
+    val onCurveChange by rememberUpdatedState(bindings.onCurveChange)
+    val textMeasurer = rememberTextMeasurer()
+    val tickStyle = TextStyle(color = onSurfaceVariant, fontSize = 9.sp)
+    fun effective() = FanCurve(pointsState.value).shiftedBy(biasState.value)
+
+    // Live marker telemetry: current SoC temp (max of CPU/GPU) + the ACTUAL fan % (read from the duty node;
+    // the RPM tach is unreliable, so we report the real fan duty % — same number the vendor app shows).
+    var liveTemp by remember { mutableStateOf<Int?>(null) }
+    var liveDutyPercent by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            val t = bindings.readTelemetry()
+            liveTemp = maxOf(t.cpuTempC ?: 0, t.gpuTempC ?: 0).takeIf { it > 0 }
+            bindings.readFanDutyPercent()?.let { liveDutyPercent = it }
+            delay(1_500)
+        }
+    }
+
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(16.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(1.dp, outline, RoundedCornerShape(16.dp)),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            // Header + live readout: "47°C · ventoinha 49%" — temp + the ACTUAL fan duty % off the device.
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(
+                    text = "CURVA PERSONALIZADA DA VENTOINHA",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = onSurfaceVariant,
+                )
+                Text(
+                    text = buildString {
+                        append(liveTemp?.let { "$it°C" } ?: "—")
+                        append(" · ventoinha ")
+                        append(liveDutyPercent?.let { "$it%" } ?: "—")
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.tertiary,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            Spacer(Modifier.height(10.dp))
+
+            // Smart (closed-loop) vs manual curve. Smart holds a target temp with minimum fan — no curve to tune.
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("MANTER TEMP. ALVO", style = MaterialTheme.typography.labelMedium, color = onSurfaceVariant)
+                    Text(
+                        if (bindings.smartEnabled) "Circuito fechado — a ventoinha se ajusta para manter o alvo em silêncio"
+                        else "Manual — você define a curva temperatura → ventoinha",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Switch(checked = bindings.smartEnabled, onCheckedChange = bindings.onSmartToggle)
+            }
+            Spacer(Modifier.height(8.dp))
+
+            if (bindings.smartEnabled) {
+                // Target SoC temperature: the PI controller holds this with the least fan it can.
+                var target by remember { mutableStateOf(bindings.targetTempC.toFloat()) }
+                LaunchedEffect(bindings.targetTempC) { target = bindings.targetTempC.toFloat() }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("TEMP. ALVO", style = MaterialTheme.typography.labelMedium, color = onSurfaceVariant)
+                    Text(
+                        "manter ${target.roundToInt()}°C",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = tertiary,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+                Slider(
+                    value = target,
+                    onValueChange = { target = it },
+                    onValueChangeFinished = { bindings.onTargetTempChange(target.roundToInt()) },
+                    valueRange = FanTempController.TARGET_MIN_C.toFloat()..FanTempController.TARGET_MAX_C.toFloat(),
+                )
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("mais frio · mais ruído", style = MaterialTheme.typography.labelSmall, color = onSurfaceVariant)
+                    Text("mais silencioso · mais quente", style = MaterialTheme.typography.labelSmall, color = onSurfaceVariant)
+                }
+                Text(
+                    text = "A ventoinha mantém o chip nessa temperatura usando a menor rotação possível: silenciosa " +
+                        "quando está frio e subindo só o necessário conforme o jogo e o ambiente. Não há curva para ajustar.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            } else {
+
+            val d = LocalDensity.current
+            val padL = with(d) { 22.dp.toPx() } // room for the % tick labels
+            val padR = with(d) { 8.dp.toPx() }
+            val padT = with(d) { 10.dp.toPx() }
+            val padB = with(d) { 16.dp.toPx() } // room for the °C tick labels
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                // Cooler ⟷ Quieter live bias on the left: up = cooler (curve lifts), down = quieter (curve drops).
+                Column(
+                    modifier = Modifier.height(190.dp).width(40.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text("FRIO", style = MaterialTheme.typography.labelSmall, color = tertiary)
+                    VerticalSlider(
+                        value = biasState.value.toFloat(),
+                        onValueChange = { biasState.value = it.roundToInt() },
+                        onValueChangeFinished = { bindings.onBiasChange(biasState.value) },
+                        valueRange = -FanCurve.MAX_BIAS.toFloat()..FanCurve.MAX_BIAS.toFloat(),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text("SILÊNCIO", style = MaterialTheme.typography.labelSmall, color = onSurfaceVariant)
+                }
+
+                Box(modifier = Modifier.weight(1f).height(190.dp)) {
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                    val left = padL; val top = padT
+                                    val w = size.width - padL - padR; val h = size.height - padT - padB
+                                    val bias = biasState.value
+                                    // Hit-test against the EFFECTIVE knee positions (where the dots are drawn).
+                                    val effPts = FanCurve(pointsState.value).shiftedBy(bias).points
+                                    var idx = -1; var best = Float.MAX_VALUE
+                                    effPts.forEachIndexed { i, p ->
+                                        val (nx, ny) = FanGraphGeometry.toNorm(p.tempC, p.percent)
+                                        val dist = hypot(down.position.x - (left + nx * w), down.position.y - (top + ny * h))
+                                        if (dist < best) { best = dist; idx = i }
+                                    }
+                                    val downNp = FanGraphGeometry.fromNorm(
+                                        (down.position.x - left) / w, (down.position.y - top) / h,
+                                    )
+                                    if (best > 60f || idx < 0) {
+                                        // Empty spot: a TAP adds a knee here; a SWIPE should scroll the page. Watch
+                                        // WITHfUT consuming and only add on a tap (no real movement) so scrolling works.
+                                        var moved = false
+                                        while (true) {
+                                            val e = awaitPointerEvent()
+                                            val c = e.changes.firstOrNull() ?: break
+                                            if (!c.pressed) break
+                                            if ((c.position - down.position).getDistance() > viewConfiguration.touchSlop) {
+                                                moved = true; break
+                                            }
+                                        }
+                                        if (moved) return@awaitEachGesture // it was a scroll — leave it to the page
+                                        val added = FanCurveEditing.addPoint(pointsState.value, downNp.tempC, downNp.percent - bias)
+                                        if (added.size != pointsState.value.size) {
+                                            pointsState.value = added
+                                            onCurveChange(FanCurve(pointsState.value))
+                                        }
+                                        return@awaitEachGesture
+                                    }
+                                    // Grabbed a knee → claim the pointer and drag it (drag off the bottom to delete).
+                                    down.consume()
+                                    var dragNy = (down.position.y - top) / h
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val change = event.changes.firstOrNull() ?: break
+                                        if (!change.pressed) break
+                                        change.consume()
+                                        val nx = (change.position.x - left) / w
+                                        dragNy = (change.position.y - top) / h
+                                        val np = FanGraphGeometry.fromNorm(nx, dragNy)
+                                        pointsState.value = FanCurveEditing.movePointBiased(
+                                            pointsState.value, idx, np.tempC, np.percent, bias,
+                                        )
+                                    }
+                                    // eragged off the bottom of the graph → eELETE the knee (keeps ≥ 2).
+                                    if (dragNy > 1.12f) pointsState.value = FanCurveEditing.removePoint(pointsState.value, idx)
+                                    onCurveChange(FanCurve(pointsState.value)) // persist BASE once, at gesture end
+                                }
+                            },
+                    ) {
+                        val left = padL; val top = padT
+                        val w = this.size.width - padL - padR; val h = this.size.height - padT - padB
+                        fun pt(tempC: Int, percent: Int): Offset {
+                            val (nx, ny) = FanGraphGeometry.toNorm(tempC, percent)
+                            return Offset(left + nx * w, top + ny * h)
+                        }
+
+                        val grid = outline.copy(alpha = 0.35f)
+                        for (t in FanGraphGeometry.TEMP_MIN_C..FanGraphGeometry.TEMP_MAX_C step 20) {
+                            val x = pt(t, 0).x
+                            drawLine(grid, Offset(x, top), Offset(x, top + h), 1f)
+                            val tl = textMeasurer.measure("$t", tickStyle)
+                            drawText(tl, topLeft = Offset(x - tl.size.width / 2f, top + h + 2f))
+                        }
+                        for (p in 0..100 step 20) {
+                            val y = pt(FanGraphGeometry.TEMP_MIN_C, p).y
+                            drawLine(grid, Offset(left, y), Offset(left + w, y), 1f)
+                            val tl = textMeasurer.measure("$p", tickStyle)
+                            drawText(tl, topLeft = Offset(left - tl.size.width - 4f, y - tl.size.height / 2f))
+                        }
+
+                        // SMOOTH curve: sample the effective spline at FLfAT precision across the temp axis so the
+                        // drawn line exactly matches the fan's response with no integer stair-stepping. Knee dots
+                        // mark the draggable control points.
+                        val spanC = (FanGraphGeometry.TEMP_MAX_C - FanGraphGeometry.TEMP_MIN_C).toFloat()
+                        fun ptF(tempC: Float, percentF: Float): Offset {
+                            val nx = ((tempC - FanGraphGeometry.TEMP_MIN_C) / spanC).coerceIn(0f, 1f)
+                            val ny = (1f - percentF / 100f).coerceIn(0f, 1f)
+                            return Offset(left + nx * w, top + ny * h)
+                        }
+                        val effCurve = effective()
+                        val pts = effCurve.points.sortedBy { it.tempC }
+                        if (pts.isNotEmpty()) {
+                            val path = Path()
+                            val first = FanGraphGeometry.TEMP_MIN_C.toFloat()
+                            val start = ptF(first, effCurve.percentForExact(first))
+                            path.moveTo(start.x, start.y)
+                            var t = first + 1f
+                            while (t <= FanGraphGeometry.TEMP_MAX_C) {
+                                val o = ptF(t, effCurve.percentForExact(t))
+                                path.lineTo(o.x, o.y)
+                                t += 1f
+                            }
+                            drawPath(path, tertiary, style = Stroke(width = 4f))
+                            pts.forEach { p ->
+                                val o = pt(p.tempC, p.percent)
+                                drawCircle(kneeFill, 9f, o)
+                                drawCircle(tertiary, 9f, o, style = Stroke(width = 3f))
+                            }
+                        }
+
+                        // Live marker: a dot riding the effective curve at the current temp + the live fan speed.
+                        liveTemp?.let { tC ->
+                            val ePct = effCurve.effectivePercent(tC)
+                            val o = pt(tC.coerceIn(FanGraphGeometry.TEMP_MIN_C, FanGraphGeometry.TEMP_MAX_C), ePct)
+                            drawLine(
+                                markerColor.copy(alpha = 0.5f),
+                                Offset(o.x, top + h), o, 2f,
+                                pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f)),
+                            )
+                            drawCircle(markerColor, 7f, o)
+                            drawCircle(markerColor.copy(alpha = 0.25f), 13f, o)
+                            liveDutyPercent?.let { pctNow ->
+                                val tl = textMeasurer.measure("$pctNow%", TextStyle(color = markerColor, fontSize = 9.sp))
+                                val lx = (o.x - tl.size.width / 2f).coerceIn(left, left + w - tl.size.width)
+                                drawText(tl, topLeft = Offset(lx, (o.y - tl.size.height - 6f).coerceAtLeast(top)))
+                            }
+                        }
+                    }
+
+                }
+            }
+
+            // Axis legend (outside the plot so nothing overlaps the curve): fan % is the vertical axis, °C the
+            // horizontal. The numbered ticks on each axis fill in the scale.
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Air, contentDescription = null, tint = tertiary, modifier = Modifier.size(13.dp))
+                    Text(" Vent. %", style = MaterialTheme.typography.labelSmall, color = onSurfaceVariant)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Temp. °C ", style = MaterialTheme.typography.labelSmall, color = onSurfaceVariant)
+                    Icon(Icons.Outlined.Thermostat, contentDescription = null, tint = onSurfaceVariant, modifier = Modifier.size(13.dp))
+                }
+            }
+
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 12.dp),
+                color = outline.copy(alpha = 0.6f),
+            )
+
+            // Response = how fast the fan ramps toward the curve (slew rate). Lower = smoother/quieter, higher
+            // = snappier. The fan always moves in tiny continuous steps, so it never audibly "steps".
+            var step by remember { mutableStateOf(bindings.responseStep.toFloat()) }
+            LaunchedEffect(bindings.responseStep) { step = bindings.responseStep.toFloat() }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("RESPOSTA", style = MaterialTheme.typography.labelMedium, color = onSurfaceVariant)
+                Text(
+                    "mais suave · ${step.roundToInt()}%/s · mais rápida",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = onSurfaceVariant,
+                )
+            }
+            Slider(
+                value = step,
+                onValueChange = { step = it },
+                onValueChangeFinished = { bindings.onResponseStepChange(step.roundToInt()) },
+                valueRange = FanCurve.MIN_SLEW.toFloat()..FanCurve.MAX_SLEW.toFloat(),
+            )
+
+            Spacer(Modifier.height(4.dp))
+            Button(
+                onClick = bindings.onAutocalibrate,
+                enabled = !bindings.calibrating,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (bindings.calibrating) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                    Spacer(Modifier.size(10.dp))
+                    Text("Calibrando…")
+                } else {
+                    Text("Autocalibrar")
+                }
+            }
+            Text(
+                text = "Arraste um ponto para moldar a curva, toque em um espaço vazio para adicionar um ponto e arraste " +
+                    "um ponto para baixo para removê-lo. A autocalibração aprende a faixa real da ventoinha e o ponto eficiente.",
+                style = MaterialTheme.typography.labelSmall,
+                color = onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            } // end manual-curve mode
+        }
+    }
+}
+
+/**
+ * A vertical [Slider] — value increases upward — for the Cooler/Quieter bias on the left of the curve graph.
+ * Rotates a standard Slider 270° and swaps its measured dimensions (the canonical Compose recipe) so it fills
+ * the height it's given. Verified on-device (can't screenshot PULSE).
+ */
+@Composable
+private fun VerticalSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    onValueChangeFinished: () -> Unit,
+    valueRange: ClosedFloatingPointRange<Float>,
+    modifier: Modifier = Modifier,
+) {
+    Box(modifier, contentAlignment = Alignment.Center) {
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            onValueChangeFinished = onValueChangeFinished,
+            valueRange = valueRange,
+            modifier = Modifier
+                .graphicsLayer { rotationZ = 270f; transformOrigin = TransformOrigin(0f, 0f) }
+                .layout { measurable, constraints ->
+                    val placeable = measurable.measure(
+                        Constraints(
+                            minWidth = constraints.minHeight,
+                            maxWidth = constraints.maxHeight,
+                            minHeight = constraints.minWidth,
+                            maxHeight = constraints.maxWidth,
+                        ),
+                    )
+                    layout(placeable.height, placeable.width) {
+                        placeable.place(-placeable.width, 0)
+                    }
+                },
+        )
+    }
+}
+
+/** Render-scale selector. Lowering resolution frees up GPU headroom; fully reversible. */
+@Composable
+fun ResolutionModule(
+    native: DisplayController.DisplaySpec?,
+    currentScale: Int,
+    onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier.fillMaxWidth()) {
+        val nativeLabel = native?.let { " · ${it.width}×${it.height}" } ?: ""
+        PulseSectionLabel("ESCALA DE RENDERIZAÇÃO$nativeLabel")
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            DisplayController.SCALES.forEach { pct ->
+                val sub = native?.let {
+                    if (pct >= 100) "nativa" else "${it.width * pct / 100}×${it.height * pct / 100}"
+                }
+                PulseChip(
+                    label = if (pct >= 100) "Nativa" else "$pct%",
+                    sub = sub,
+                    selected = currentScale == pct,
+                    accent = MaterialTheme.colorScheme.primary,
+                    onClick = { onSelect(pct) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PulseChip(
+    label: String,
+    selected: Boolean,
+    accent: Color,
+    onClick: () -> Unit,
+    sub: String? = null,
+) {
+    val container = if (selected) accent.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surfaceContainerHigh
+    val borderColor = if (selected) accent else MaterialTheme.colorScheme.outline
+    Surface(
+        color = container,
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier
+            .border(1.dp, borderColor, RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.titleSmall,
+                color = if (selected) accent else MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+            )
+            if (sub != null) {
+                Text(
+                    text = sub,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+/** Live telemetry HUe: polls clocks / load / battery / temps / draw every 1.5s. */
+@Composable
+fun TelemetryHud(
+    readTelemetry: suspend () -> TelemetrySnapshot,
+    estimatedPeakW: Float? = null,
+    modifier: Modifier = Modifier,
+) {
+    var snap by remember { mutableStateOf(TelemetrySnapshot()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            snap = readTelemetry()
+            delay(1_500)
+        }
+    }
+    val cpuMhz = snap.cpuClocksMhz.values.maxOrNull()
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(16.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(16.dp)),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            val muted = MaterialTheme.colorScheme.onSurfaceVariant
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                TelemetryMetric("CPU", cpuMhz?.toString(), "MHz", MaterialTheme.colorScheme.primary, Modifier.weight(1f))
+                TelemetryMetric("GPU", snap.gpuMhz?.toString(), "MHz", MaterialTheme.colorScheme.tertiary, Modifier.weight(1f))
+                TelemetryMetric("CARGA CPU", snap.cpuLoadPercent?.toString(), "%", loadColor(snap.cpuLoadPercent, muted), Modifier.weight(1f))
+                TelemetryMetric("BAT", snap.batteryPercent?.toString(), "%", MaterialTheme.colorScheme.onSurface, Modifier.weight(1f))
+            }
+            HorizontalDivider(
+                modifier = Modifier.padding(vertical = 12.dp),
+                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.6f),
+            )
+            val drawValue = snap.batteryDrawW?.let { String.format(java.util.Locale.US, "%.1f", it) } ?: snap.batteryDrawMa?.toString()
+            val drawUnit = if (snap.batteryDrawW != null) "W" else "mA"
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                TelemetryMetric("TEMP. CPU", snap.cpuTempC?.toString(), "°C", tempColor(snap.cpuTempC, muted), Modifier.weight(1f))
+                TelemetryMetric("TEMP. GPU", snap.gpuTempC?.toString(), "°C", tempColor(snap.gpuTempC, muted), Modifier.weight(1f))
+                TelemetryMetric("CONSUMO", drawValue, drawUnit, drawColor(snap.batteryDrawW, snap.batteryDrawMa, estimatedPeakW, snap.isDischarging, muted), Modifier.weight(1f))
+                TelemetryMetric("PICO EST.", estimatedPeakW?.let { String.format(java.util.Locale.US, "%.0f", it) }, "W", MaterialTheme.colorScheme.onSurface, Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+// Semantic meter ramp: green/cool (low) → amber (mid) → red (high). Used for temps, GPU load,
+// and power draw so the colour describes what the reading is doing, not the theme. CPU/GPU
+// clocks keep their theme identity colours; this is the "eirection A" semantic-meter scheme.
+private val MeterCool = Color(0xFF4Fe89B)
+private val MeterWarm = Color(0xFFFFB000)
+private val MeterHot = Color(0xFFFF5e6C)
+
+private fun meterRamp(fraction: Float): Color {
+    val f = fraction.coerceIn(0f, 1f)
+    return if (f < 0.5f) lerp(MeterCool, MeterWarm, f * 2f) else lerp(MeterWarm, MeterHot, (f - 0.5f) * 2f)
+}
+
+private fun tempColor(c: Int?, fallback: Color): Color =
+    c?.let { meterRamp((it - 40f) / 50f) } ?: fallback // 40°C cool → 90°C hot
+
+private fun loadColor(percent: Int?, fallback: Color): Color =
+    percent?.let { meterRamp(it / 100f) } ?: fallback
+
+private fun drawColor(watts: Float?, milliamps: Int?, ceilingW: Float?, isDischarging: Boolean, fallback: Color): Color = when {
+    !isDischarging -> fallback // plugged in: the reading is charger current, not system draw
+    watts != null -> meterRamp(watts / (ceilingW?.takeIf { it > 1f } ?: 18f))
+    milliamps != null -> meterRamp(milliamps / 4000f)
+    else -> fallback
+}
+
+@Composable
+private fun TelemetryMetric(
+    label: String,
+    value: String?,
+    unit: String,
+    accent: Color,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = value ?: "—",
+            style = MaterialTheme.typography.titleLarge,
+            color = if (value != null) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = unit,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** CPU governor selector (#4). */
+@Composable
+fun GovernorModule(current: String?, onSelect: (GovernorOption) -> Unit, modifier: Modifier = Modifier) {
+    val activeOption = GovernorController.optionForGovernor(current)
+    Column(modifier = modifier.fillMaxWidth()) {
+        PulseSectionLabel("GOVERNADOR CPU${current?.let { " · ${it.uppercase()}" } ?: ""}")
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            GovernorController.OPTIONS.forEach { opt ->
+                PulseChip(
+                    label = opt.label,
+                    selected = activeOption == opt,
+                    accent = MaterialTheme.colorScheme.primary,
+                    onClick = { onSelect(opt) },
+                )
+            }
+        }
+    }
+}
+
+/** Display refresh-rate selector (#8). */
+@Composable
+fun RefreshRateModule(current: Int?, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
+    Column(modifier = modifier.fillMaxWidth()) {
+        PulseSectionLabel("TAXA DE ATUALIZAÇÃO${current?.let { " · ${it}HZ" } ?: ""}")
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            RefreshRateController.RATES.forEach { hz ->
+                PulseChip(
+                    label = "$hz Hz",
+                    selected = current == hz,
+                    accent = MaterialTheme.colorScheme.secondary,
+                    onClick = { onSelect(hz) },
+                )
+            }
+        }
+    }
+}
+
+/** GPU minimum-clock floor selector (#5). 0 = no floor. */
+@Composable
+fun GpuFloorModule(
+    currentPercent: Int,
+    locked: Boolean,
+    onSelect: (Int) -> Unit,
+    onToggleLock: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val options = listOf(0, 25, 50, 75)
+    Column(modifier = modifier.fillMaxWidth()) {
+        PulseSectionLabel("PISO GPU")
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Travar no clock selecionado",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Switch(checked = locked, onCheckedChange = onToggleLock)
+        }
+        if (locked) {
+            Text(
+                text = "Travado no clock atual da GPU — defina e aplique a frequência da GPU primeiro, depois trave. O piso fica desativado enquanto estiver travado.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp, start = 4.dp, end = 4.dp),
+            )
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(top = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                options.forEach { pct ->
+                    PulseChip(
+                        label = if (pct == 0) "Desligado" else "$pct%",
+                        selected = currentPercent == pct,
+                        accent = MaterialTheme.colorScheme.tertiary,
+                        onClick = { onSelect(pct) },
+                    )
+                }
+            }
+            Text(
+                text = "Impede a GPU de cair abaixo desta parcela do máximo — pacing mais estável em jogos exigentes.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp, start = 4.dp, end = 4.dp),
+            )
+        }
+    }
+}
+
+/**
+ * Power Target (the "TeP-style" master control). Not real watts — Snapdragon has no
+ * programmable wattage cap — but one slider scaling every CPU + GPU ceiling together.
+ * While enabled it owns those limits, so the individual sliders are locked.
+ */
+@Composable
+fun PowerTargetModule(
+    enabled: Boolean,
+    percent: Int,
+    cpuOnly: Boolean,
+    onEnabledChange: (Boolean) -> Unit,
+    onPercentChange: (Int) -> Unit,
+    onCpuOnlyChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var live by remember(percent) { mutableStateOf(percent.toFloat()) }
+    Surface(
+        color = if (enabled) MaterialTheme.colorScheme.primary.copy(alpha = 0.10f) else MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(16.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(
+                1.dp,
+                if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                RoundedCornerShape(16.dp),
+            ),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text(
+                        text = "ALVO DE POTÊNCIA",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = if (enabled) "${live.toInt()}%" else "Desligado",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+                Switch(checked = enabled, onCheckedChange = onEnabledChange)
+            }
+            if (enabled) {
+                Slider(
+                    value = live,
+                    onValueChange = { live = it },
+                    onValueChangeFinished = { onPercentChange(live.toInt()) },
+                    valueRange = 40f..100f,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                Text(
+                    text = if (cpuOnly) {
+                        "Ajusta apenas os clusters de CPU — a GPU fica no próprio slider e piso."
+                    } else {
+                        "Ajusta todos os clusters de CPU e a GPU juntos. Os sliders individuais abaixo ficam travados enquanto isto estiver ligado."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Somente CPU",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Switch(checked = cpuOnly, onCheckedChange = onCpuOnlyChange)
+                }
+            }
+        }
+    }
+}
+
+/** Format a watt ceiling for the UI: 11.0→"11", 12.5→"12.5". */
+/**
+ * AutoTeP master toggle. When on, PULSE dynamically trims the CPU first, then GPU, to hold each
+ * foreground game's refresh-rate FPS (uses your Custom fan if set, otherwise Smart; refresh rate
+ * untouched). It becomes the default for any game without its own per-app binding, so the manual
+ * tier/clock controls are locked — but the fan stays adjustable.
+ */
+@Composable
+fun AutoTdpModule(
+    enabled: Boolean,
+    onEnabledChange: (Boolean) -> Unit,
+    fpsTarget: Int,
+    fpsOptions: List<Int>,
+    onFpsTargetChange: (Int) -> Unit,
+    tdpLimitW: Int,
+    onTdpLimitChange: (Int) -> Unit,
+    aggressivePark: Boolean,
+    onAggressiveParkChange: (Boolean) -> Unit,
+    bias: AutoTdpBias,
+    onBiasChange: (AutoTdpBias) -> Unit,
+    onPresetSelect: (AutoTdpPreset) -> Unit,
+    showWattCaps: Boolean = true, // only the fdin enforces per-mode watt caps; hidden on the Se 8 Gen 2
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = if (enabled) MaterialTheme.colorScheme.primary.copy(alpha = 0.10f) else MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(16.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(
+                1.dp,
+                if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                RoundedCornerShape(16.dp),
+            ),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "AUTOTDP",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        text = if (enabled) "Autoajustar jogos" else "Desligado",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                    )
+                }
+                Switch(checked = enabled, onCheckedChange = onEnabledChange)
+            }
+            Text(
+                text = if (enabled) {
+                    "Ajusta os clocks de CPU e GPU em tempo real para manter a taxa de quadros do app com o menor " +
+                        "consumo possível. Usa sua ventoinha personalizada, se existir; caso contrário, usa a ventoinha inteligente. " +
+                        "Os controles manuais de tier e clock ficam travados enquanto o AutoTDP está ligado, mas a ventoinha continua ajustável."
+                } else {
+                    "Ajusta CPU e GPU automaticamente para manter o alvo de FPS com o menor consumo possível em jogos, " +
+                        "emuladores e mídia. Usa a ventoinha personalizada se configurada; caso contrário, usa a inteligente. " +
+                        "Perfis por app continuam tendo prioridade."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+            if (enabled) {
+                Text(
+                    text = "PRESETS",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 12.dp, bottom = 6.dp),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    AutoTdpPreset.entries.forEach { preset ->
+                        val presetFps = PerAppConfig.snapFpsTarget(preset.fpsTarget, fpsOptions)
+                        PulseChip(
+                            label = "${preset.label} ${preset.tagline}",
+                            selected = fpsTarget == presetFps &&
+                                tdpLimitW == PerAppConfig.clampTdpLimitW(preset.tdpLimitW) &&
+                                bias == preset.bias &&
+                                aggressivePark == preset.aggressivePark,
+                            accent = MaterialTheme.colorScheme.primary,
+                            onClick = { onPresetSelect(preset) },
+                        )
+                    }
+                }
+                Text(
+                    text = "ALVO DE FPS PADRÃO",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 12.dp, bottom = 6.dp),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    fpsOptions.forEach { target ->
+                        PulseChip(
+                            label = PerAppConfig.fpsTargetLabel(target),
+                            selected = fpsTarget == target,
+                            accent = MaterialTheme.colorScheme.primary,
+                            onClick = { onFpsTargetChange(target) },
+                        )
+                    }
+                }
+                if (showWattCaps) {
+                    var liveTdp by remember(tdpLimitW) { mutableStateOf(tdpLimitW.toFloat()) }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "LIMITE DE TDP",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            text = "${liveTdp.roundToInt()} W",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    Slider(
+                        value = liveTdp,
+                        onValueChange = { liveTdp = it },
+                        onValueChangeFinished = { onTdpLimitChange(liveTdp.roundToInt()) },
+                        valueRange = PerAppConfig.MIN_TDP_LIMIT_W.toFloat()..PerAppConfig.MAX_TDP_LIMIT_W.toFloat(),
+                        steps = PerAppConfig.MAX_TDP_LIMIT_W - PerAppConfig.MIN_TDP_LIMIT_W - 1,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text(
+                            text = "Park agressivo",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            text = "Desliga os núcleos Prime em emuladores pesados quando eles não são o limite, " +
+                                "e religa imediatamente quando a taxa de quadros cai. Economiza mais energia, com comportamento um pouco mais agressivo.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(checked = aggressivePark, onCheckedChange = onAggressiveParkChange)
+                }
+                Text(
+                    text = "EFICIÊNCIA",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 14.dp, bottom = 6.dp),
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    AutoTdpBias.entries.forEach { b ->
+                        PulseChip(
+                            label = b.label,
+                            selected = bias == b,
+                            accent = MaterialTheme.colorScheme.primary,
+                            onClick = { onBiasChange(b) },
+                        )
+                    }
+                }
+                Text(
+                    text = (if (showWattCaps)
+                        "Limita a potência sustentada perto de ${tdpLimitW} W; valores menores reduzem calor e consumo. " else "") + when (bias) {
+                        AutoTdpBias.EFFICIENT ->
+                            "Corta clocks com mais força enquanto o jogo está estável; só recua em engasgos sustentados. " +
+                                "Menor consumo e menos ruído, com chance de microtravadas raras nos momentos mais pesados."
+                        AutoTdpBias.BALANCED ->
+                            "Meio-termo — corta clocks em jogo estável, mas recua um pouco antes quando há instabilidade."
+                        AutoTdpBias.SMOOTH ->
+                            "Protege os frames primeiro, mantendo clocks mais altos para evitar engasgos. Maior consumo/calor."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+        }
+    }
+}
+
+/** CPU minimum-clock floor selector. 0 = no floor. Mirrors the GPU floor. */
+@Composable
+fun CpuFloorModule(currentPercent: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
+    val options = listOf(0, 25, 50, 75)
+    Column(modifier = modifier.fillMaxWidth()) {
+        PulseSectionLabel("PISO CPU")
+        Row(
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            options.forEach { pct ->
+                PulseChip(
+                    label = if (pct == 0) "Desligado" else "$pct%",
+                    selected = currentPercent == pct,
+                    accent = MaterialTheme.colorScheme.primary,
+                    onClick = { onSelect(pct) },
+                )
+            }
+        }
+        Text(
+            text = "Mantém os clusters de CPU acima desta parcela do máximo (scaling_min_freq) — resposta mais rápida, mais consumo em repouso. Limitado abaixo do seu cap.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 8.dp, start = 4.dp, end = 4.dp),
+        )
+    }
+}

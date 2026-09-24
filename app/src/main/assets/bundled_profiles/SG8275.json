@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "socModel": "SG8275",
+  "displayName": "AYANEO Pocket S 2K (Snapdragon G3x Gen 2)",
+  "cpuClusters": [
+    {
+      "id": "policy0",
+      "name": "Eficiência",
+      "affectedCpus": [0, 1, 2],
+      "minFreqKhz": 307200,
+      "maxFreqKhz": 2016000,
+      "availableFrequenciesKhz": [307200, 441600, 556800, 672000, 787200, 902400, 1017600, 1113600, 1228800, 1344000, 1459200, 1555200, 1670400, 1785600, 1900800, 2016000]
+    },
+    {
+      "id": "policy3",
+      "name": "Desempenho",
+      "affectedCpus": [3, 4, 5, 6],
+      "minFreqKhz": 499200,
+      "maxFreqKhz": 2707200,
+      "availableFrequenciesKhz": [499200, 614400, 729600, 844800, 940800, 1056000, 1171200, 1286400, 1401600, 1536000, 1651200, 1785600, 1920000, 2054400, 2188800, 2323200, 2457600, 2592000, 2707200]
+    },
+    {
+      "id": "policy7",
+      "name": "Prime",
+      "affectedCpus": [7],
+      "minFreqKhz": 595200,
+      "maxFreqKhz": 2956800,
+      "availableFrequenciesKhz": [595200, 729600, 864000, 998400, 1132800, 1248000, 1363200, 1478400, 1593600, 1708800, 1843200, 1977600, 2092800, 2227200, 2342400, 2476800, 2592000, 2726400, 2841600, 2956800]
+    }
+  ],
+  "gpu": {
+    "path": "/sys/class/kgsl/kgsl-3d0",
+    "minPwrlevelNode": "min_pwrlevel",
+    "maxPwrlevelNode": "max_pwrlevel",
+    "availableFrequenciesHz": [1000000000, 860000000, 827000000, 794000000, 746000000, 719000000, 680000000, 615000000, 550000000, 475000000, 401000000, 348000000, 295000000, 220000000, 124800000],
+    "recommendedStabilityCapHz": 860000000,
+    "recommendedStabilityCapNote": "860MHz confirmado como sweet spot de estabilidade em testes 3DMark WLE no Pocket EVO (mesmo chip G3x Gen2/kalama)."
+  },
+  "profiles": [
+    {
+      "id": "bundled_sg8275_stock",
+      "name": "Padrão",
+      "maxFrequencies": {
+        "0": 2016000,
+        "3": 2707200,
+        "7": 2956800,
+        "-100": 1000000
+      }
+    },
+    {
+      "id": "bundled_sg8275_stable_860",
+      "name": "Estável (GPU limitada a 860MHz)",
+      "maxFrequencies": {
+        "0": 2016000,
+        "3": 2707200,
+        "7": 2956800,
+        "-100": 860000
+      }
+    }
+  ]
+}
